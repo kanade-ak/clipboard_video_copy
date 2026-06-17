@@ -1,0 +1,2 @@
+# clipboard_video_copy
+AviUtl2に動画のコピーを追加します
