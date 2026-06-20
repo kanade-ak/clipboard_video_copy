@@ -40,6 +40,11 @@ constexpr wchar_t kMenuTextCopyVideo[] =
 constexpr wchar_t kMenuTextCopyVideoAlpha[] =
     L"\u30AF\u30EA\u30C3\u30D7\u30DC\u30FC\u30C9\u306B\u52D5\u753B\u3092\u30B3\u30D4\u30FC"
     L"(\u80CC\u666F\u900F\u904E)";
+constexpr wchar_t kMenuTextCopyGif[] =
+    L"\u30AF\u30EA\u30C3\u30D7\u30DC\u30FC\u30C9\u306Bgif\u3092\u30B3\u30D4\u30FC";
+constexpr wchar_t kMenuTextCopyGifAlpha[] =
+    L"\u30AF\u30EA\u30C3\u30D7\u30DC\u30FC\u30C9\u306Bgif\u3092\u30B3\u30D4\u30FC"
+    L"(\u80CC\u666F\u900F\u904E)";
 constexpr wchar_t kMenuNeedleClipboard[] =
     L"\u30AF\u30EA\u30C3\u30D7\u30DC\u30FC\u30C9";
 constexpr wchar_t kMenuNeedleImage[] =
@@ -62,9 +67,19 @@ using TrackPopupMenuExPtr = BOOL(WINAPI*)(HMENU, UINT, int, int, HWND, LPTPMPARA
 TrackPopupMenuPtr TrueTrackPopupMenu = TrackPopupMenu;
 TrackPopupMenuExPtr TrueTrackPopupMenuEx = TrackPopupMenuEx;
 
+enum class CopyFormat {
+    Video,
+    Gif,
+};
+
+struct CopyCommand {
+    CopyFormat format = CopyFormat::Video;
+    bool alpha = false;
+};
+
 COMMON_PLUGIN_TABLE g_common_plugin_table = {
     kPluginName,
-    L"Clipboard Video Copy version 0.2"
+    L"Clipboard Video Copy version 0.3"
 };
 
 std::wstring FormatWin32Error(DWORD error)
@@ -172,10 +187,13 @@ bool GetMenuText(HMENU menu, int position, std::wstring* text)
 
 bool IsOurMenuText(const std::wstring& text)
 {
-    return text == kMenuTextCopyVideo || text == kMenuTextCopyVideoAlpha;
+    return text == kMenuTextCopyVideo ||
+           text == kMenuTextCopyVideoAlpha ||
+           text == kMenuTextCopyGif ||
+           text == kMenuTextCopyGifAlpha;
 }
 
-bool MenuAlreadyHasVideoItems(HMENU menu)
+bool MenuAlreadyHasCopyItems(HMENU menu)
 {
     const int count = GetMenuItemCount(menu);
     for (int i = 0; i < count; ++i) {
@@ -230,9 +248,9 @@ void InsertStringMenuItem(HMENU menu, int position, UINT_PTR id, LPCWSTR text)
     InsertMenuItemW(menu, static_cast<UINT>(position), TRUE, &item);
 }
 
-void EnsureVideoMenuItems(HMENU menu)
+void EnsureCopyMenuItems(HMENU menu)
 {
-    if (!menu || !g_edit || MenuAlreadyHasVideoItems(menu)) {
+    if (!menu || !g_edit || MenuAlreadyHasCopyItems(menu)) {
         return;
     }
 
@@ -242,12 +260,19 @@ void EnsureVideoMenuItems(HMENU menu)
     }
 
     const UINT video_id = FindUnusedMenuId(menu, kCopyVideoIdBase);
-    const UINT alpha_id = FindUnusedMenuId(menu, video_id + 1);
     InsertStringMenuItem(menu, target + 1, video_id, kMenuTextCopyVideo);
-    InsertStringMenuItem(menu, target + 2, alpha_id, kMenuTextCopyVideoAlpha);
+
+    const UINT video_alpha_id = FindUnusedMenuId(menu, video_id + 1);
+    InsertStringMenuItem(menu, target + 2, video_alpha_id, kMenuTextCopyVideoAlpha);
+
+    const UINT gif_id = FindUnusedMenuId(menu, video_alpha_id + 1);
+    InsertStringMenuItem(menu, target + 3, gif_id, kMenuTextCopyGif);
+
+    const UINT gif_alpha_id = FindUnusedMenuId(menu, gif_id + 1);
+    InsertStringMenuItem(menu, target + 4, gif_alpha_id, kMenuTextCopyGifAlpha);
 }
 
-bool IsVideoMenuCommand(HMENU menu, BOOL command, bool* alpha)
+bool IsCopyMenuCommand(HMENU menu, BOOL command, CopyCommand* copy_command)
 {
     if (!menu || command == 0) {
         return false;
@@ -265,11 +290,23 @@ bool IsVideoMenuCommand(HMENU menu, BOOL command, bool* alpha)
 
     const std::wstring text = buffer;
     if (text == kMenuTextCopyVideo) {
-        *alpha = false;
+        copy_command->format = CopyFormat::Video;
+        copy_command->alpha = false;
         return true;
     }
     if (text == kMenuTextCopyVideoAlpha) {
-        *alpha = true;
+        copy_command->format = CopyFormat::Video;
+        copy_command->alpha = true;
+        return true;
+    }
+    if (text == kMenuTextCopyGif) {
+        copy_command->format = CopyFormat::Gif;
+        copy_command->alpha = false;
+        return true;
+    }
+    if (text == kMenuTextCopyGifAlpha) {
+        copy_command->format = CopyFormat::Gif;
+        copy_command->alpha = true;
         return true;
     }
     return false;
@@ -871,20 +908,52 @@ std::wstring BuildFfmpegCommand(const std::wstring& ffmpeg,
     return command;
 }
 
-bool EncodeVideoToFile(const EDIT_INFO& info,
-                       int start_frame,
-                       int end_frame,
-                       bool alpha,
-                       const std::wstring& audio_path,
-                       const std::wstring& output_path,
-                       std::wstring* error)
+std::wstring BuildGifFfmpegCommand(const std::wstring& ffmpeg,
+                                   const EDIT_INFO& info,
+                                   bool alpha,
+                                   const std::wstring& output_path)
 {
-    const std::wstring ffmpeg = FindFfmpeg();
-    if (ffmpeg.empty()) {
-        *error = L"ffmpeg.exe が見つかりません。PATH、プラグインフォルダ、または C:\\ffmpeg\\bin に配置してください";
-        return false;
-    }
+    const std::wstring size = std::to_wstring(info.width) + L"x" + std::to_wstring(info.height);
+    const std::wstring rate = std::to_wstring(info.rate) + L"/" + std::to_wstring(info.scale);
+    const std::wstring filter = alpha
+        ? L"[0:v]split[s0][s1];[s0]palettegen=reserve_transparent=1:stats_mode=full[p];[s1][p]paletteuse=alpha_threshold=128[gif]"
+        : L"[0:v]split[s0][s1];[s0]palettegen=stats_mode=full[p];[s1][p]paletteuse=dither=sierra2_4a[gif]";
 
+    std::vector<std::wstring> args = {
+        ffmpeg,
+        L"-y",
+        L"-hide_banner",
+        L"-loglevel", L"error",
+        L"-f", L"rawvideo",
+        L"-pix_fmt", L"rgba",
+        L"-video_size", size,
+        L"-framerate", rate,
+        L"-i", L"pipe:0",
+        L"-filter_complex", filter,
+        L"-map", L"[gif]",
+        L"-loop", L"0",
+        L"-f", L"gif",
+        output_path
+    };
+
+    std::wstring command;
+    for (const auto& arg : args) {
+        if (!command.empty()) {
+            command.push_back(L' ');
+        }
+        command += QuoteArg(arg);
+    }
+    return command;
+}
+
+bool EncodeFramesToFile(const EDIT_INFO& info,
+                        int start_frame,
+                        int end_frame,
+                        bool keep_alpha,
+                        const std::wstring& command,
+                        const std::wstring& output_path,
+                        std::wstring* error)
+{
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
@@ -911,9 +980,9 @@ bool EncodeVideoToFile(const EDIT_INFO& info,
     startup.hStdError = stderr_write.get();
 
     PROCESS_INFORMATION process{};
-    std::wstring command = BuildFfmpegCommand(ffmpeg, info, alpha, audio_path, output_path);
+    std::wstring command_line = command;
     if (!CreateProcessW(nullptr,
-                        command.data(),
+                        command_line.data(),
                         nullptr,
                         nullptr,
                         TRUE,
@@ -942,7 +1011,7 @@ bool EncodeVideoToFile(const EDIT_INFO& info,
             *error = L"フレーム " + std::to_wstring(frame) + L" のレンダリングに失敗しました";
             break;
         }
-        if (!alpha) {
+        if (!keep_alpha) {
             OpaqueAlpha(&frame_pixels);
         }
         if (!WriteAll(stdin_write.get(), frame_pixels.data(), frame_pixels.size())) {
@@ -981,6 +1050,41 @@ bool EncodeVideoToFile(const EDIT_INFO& info,
         return false;
     }
     return true;
+}
+
+bool EncodeVideoToFile(const EDIT_INFO& info,
+                       int start_frame,
+                       int end_frame,
+                       bool alpha,
+                       const std::wstring& audio_path,
+                       const std::wstring& output_path,
+                       std::wstring* error)
+{
+    const std::wstring ffmpeg = FindFfmpeg();
+    if (ffmpeg.empty()) {
+        *error = L"ffmpeg.exe が見つかりません。PATH、プラグインフォルダ、または C:\\ffmpeg\\bin に配置してください";
+        return false;
+    }
+
+    const std::wstring command = BuildFfmpegCommand(ffmpeg, info, alpha, audio_path, output_path);
+    return EncodeFramesToFile(info, start_frame, end_frame, alpha, command, output_path, error);
+}
+
+bool EncodeGifToFile(const EDIT_INFO& info,
+                     int start_frame,
+                     int end_frame,
+                     bool alpha,
+                     const std::wstring& output_path,
+                     std::wstring* error)
+{
+    const std::wstring ffmpeg = FindFfmpeg();
+    if (ffmpeg.empty()) {
+        *error = L"ffmpeg.exe が見つかりません。PATH、プラグインフォルダ、または C:\\ffmpeg\\bin に配置してください";
+        return false;
+    }
+
+    const std::wstring command = BuildGifFfmpegCommand(ffmpeg, info, alpha, output_path);
+    return EncodeFramesToFile(info, start_frame, end_frame, alpha, command, output_path, error);
 }
 
 bool EnsureOleInitialized(std::wstring* error)
@@ -1167,6 +1271,11 @@ std::wstring BuildTempVideoPath(bool alpha, std::wstring* error)
     return BuildTempFilePath(alpha ? L"alpha" : L"video", alpha ? L"mov" : L"mp4", error);
 }
 
+std::wstring BuildTempGifPath(bool alpha, std::wstring* error)
+{
+    return BuildTempFilePath(alpha ? L"gif_alpha" : L"gif", L"gif", error);
+}
+
 std::wstring BuildTempAudioPath(std::wstring* error)
 {
     return BuildTempFilePath(L"audio", L"f32le", error);
@@ -1329,7 +1438,7 @@ bool SetFileClipboard(const std::wstring& path, std::wstring* error)
     return true;
 }
 
-void CopySelectedRangeVideo(bool alpha)
+void CopySelectedRange(CopyFormat format, bool alpha)
 {
     bool expected = false;
     if (!g_copying.compare_exchange_strong(expected, true)) {
@@ -1375,46 +1484,56 @@ void CopySelectedRangeVideo(bool alpha)
     }
 
     const int frame_count = end - start + 1;
-    LogInfo(L"Clipboard Video Copy: encoding " + std::to_wstring(frame_count) + L" frames");
+    const bool gif = format == CopyFormat::Gif;
+    LogInfo(L"Clipboard Video Copy: encoding " + std::to_wstring(frame_count) + (gif ? L" GIF frames" : L" video frames"));
 
     std::wstring error;
-    std::wstring file_path = BuildTempVideoPath(alpha, &error);
+    std::wstring file_path = gif ? BuildTempGifPath(alpha, &error) : BuildTempVideoPath(alpha, &error);
     if (file_path.empty()) {
         LogError(error);
         ShowMessage(MB_ICONERROR, error);
         return;
     }
 
-    std::wstring audio_path = BuildTempAudioPath(&error);
-    if (audio_path.empty()) {
-        LogError(error);
-        ShowMessage(MB_ICONERROR, error);
-        return;
-    }
+    if (gif) {
+        if (!EncodeGifToFile(info, start, end, alpha, file_path, &error)) {
+            DeleteFileW(file_path.c_str());
+            LogError(error);
+            ShowMessage(MB_ICONERROR, error);
+            return;
+        }
+    } else {
+        std::wstring audio_path = BuildTempAudioPath(&error);
+        if (audio_path.empty()) {
+            LogError(error);
+            ShowMessage(MB_ICONERROR, error);
+            return;
+        }
 
-    bool has_audio = false;
-    if (!WriteAudioRangeToFile(info, start, end, audio_path, &has_audio, &error)) {
-        DeleteFileW(audio_path.c_str());
-        LogError(error);
-        ShowMessage(MB_ICONERROR, error);
-        return;
-    }
-    if (!has_audio) {
-        DeleteFileW(audio_path.c_str());
-        audio_path.clear();
-    }
+        bool has_audio = false;
+        if (!WriteAudioRangeToFile(info, start, end, audio_path, &has_audio, &error)) {
+            DeleteFileW(audio_path.c_str());
+            LogError(error);
+            ShowMessage(MB_ICONERROR, error);
+            return;
+        }
+        if (!has_audio) {
+            DeleteFileW(audio_path.c_str());
+            audio_path.clear();
+        }
 
-    if (!EncodeVideoToFile(info, start, end, alpha, audio_path, file_path, &error)) {
+        if (!EncodeVideoToFile(info, start, end, alpha, audio_path, file_path, &error)) {
+            if (!audio_path.empty()) {
+                DeleteFileW(audio_path.c_str());
+            }
+            DeleteFileW(file_path.c_str());
+            LogError(error);
+            ShowMessage(MB_ICONERROR, error);
+            return;
+        }
         if (!audio_path.empty()) {
             DeleteFileW(audio_path.c_str());
         }
-        DeleteFileW(file_path.c_str());
-        LogError(error);
-        ShowMessage(MB_ICONERROR, error);
-        return;
-    }
-    if (!audio_path.empty()) {
-        DeleteFileW(audio_path.c_str());
     }
 
     if (!SetFileClipboard(file_path, &error)) {
@@ -1424,9 +1543,13 @@ void CopySelectedRangeVideo(bool alpha)
     }
 
     ShowMessage(MB_ICONINFORMATION,
-                alpha
-                    ? L"選択範囲の透過動画をクリップボードにコピーしました\n" + file_path
-                    : L"選択範囲の動画をクリップボードにコピーしました\n" + file_path);
+                gif
+                    ? (alpha
+                        ? L"選択範囲の透過GIFをクリップボードにコピーしました\n" + file_path
+                        : L"選択範囲のGIFをクリップボードにコピーしました\n" + file_path)
+                    : (alpha
+                        ? L"選択範囲の透過動画をクリップボードにコピーしました\n" + file_path
+                        : L"選択範囲の動画をクリップボードにコピーしました\n" + file_path));
 }
 
 BOOL WINAPI HookTrackPopupMenu(HMENU menu,
@@ -1437,11 +1560,11 @@ BOOL WINAPI HookTrackPopupMenu(HMENU menu,
                               HWND hwnd,
                               const RECT* rect)
 {
-    EnsureVideoMenuItems(menu);
+    EnsureCopyMenuItems(menu);
     BOOL command = TrueTrackPopupMenu(menu, flags, x, y, reserved, hwnd, rect);
-    bool alpha = false;
-    if (IsVideoMenuCommand(menu, command, &alpha)) {
-        CopySelectedRangeVideo(alpha);
+    CopyCommand copy_command;
+    if (IsCopyMenuCommand(menu, command, &copy_command)) {
+        CopySelectedRange(copy_command.format, copy_command.alpha);
         return 0;
     }
     return command;
@@ -1449,11 +1572,11 @@ BOOL WINAPI HookTrackPopupMenu(HMENU menu,
 
 BOOL WINAPI HookTrackPopupMenuEx(HMENU menu, UINT flags, int x, int y, HWND hwnd, LPTPMPARAMS params)
 {
-    EnsureVideoMenuItems(menu);
+    EnsureCopyMenuItems(menu);
     BOOL command = TrueTrackPopupMenuEx(menu, flags, x, y, hwnd, params);
-    bool alpha = false;
-    if (IsVideoMenuCommand(menu, command, &alpha)) {
-        CopySelectedRangeVideo(alpha);
+    CopyCommand copy_command;
+    if (IsCopyMenuCommand(menu, command, &copy_command)) {
+        CopySelectedRange(copy_command.format, copy_command.alpha);
         return 0;
     }
     return command;
